@@ -1,0 +1,38 @@
+name: infra
+on:
+  push:
+    branches: [ develop, test, master ]
+  pull_request:
+    branches: [ develop, test, master ]
+
+jobs:
+  tf:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [ dev, test, prod ]
+    # Run only the matching env for the branch
+    if: |
+      (github.ref == 'refs/heads/develop' && matrix.env == 'dev') ||
+      (github.ref == 'refs/heads/test'    && matrix.env == 'test') ||
+      (github.ref == 'refs/heads/master'  && matrix.env == 'prod')
+
+    environment: ${{ matrix.env }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA_EMAIL }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init/Plan/Apply
+        working-directory: infra/terraform/envs/${{ matrix.env }}
+        run: |
+          terraform init -input=false
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan

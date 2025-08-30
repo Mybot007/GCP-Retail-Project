@@ -1,0 +1,5 @@
+[
+  {"name":"order_date","type":"DATE","mode":"REQUIRED"},
+  {"name":"orders","type":"INTEGER","mode":"REQUIRED"},
+  {"name":"revenue","type":"NUMERIC","mode":"REQUIRED"}
+]

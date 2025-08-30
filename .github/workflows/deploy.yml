@@ -1,0 +1,15 @@
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build and push image
+        run: |
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/bronze:latest ./apps/bronze
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/bronze:latest
+        env:
+          ENV: dev
+          PROJECT_ID: speedy-carver-470315-s4
+          REGION: asia-south1
+          REPO_NAME: retail-dev-containers
