@@ -1,0 +1,7 @@
+[
+  {"name":"order_id","type":"INTEGER","mode":"REQUIRED"},
+  {"name":"customer_id","type":"INTEGER","mode":"REQUIRED"},
+  {"name":"amount","type":"NUMERIC","mode":"NULLABLE"},
+  {"name":"updated_at","type":"TIMESTAMP","mode":"REQUIRED"},
+  {"name":"_ingest_load_id","type":"STRING","mode":"NULLABLE"}
+]

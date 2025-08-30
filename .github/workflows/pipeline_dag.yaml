@@ -1,0 +1,110 @@
+name: pipeline-dag
+on:
+  push:
+    branches:
+      - develop
+      - test
+      - master
+      - 'feature/**'
+
+jobs:
+  dag:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [ dev, test, prod ]
+    # feature/* and develop -> dev ; test -> test ; master -> prod
+    if: |
+      (startsWith(github.ref, 'refs/heads/feature/') && matrix.env == 'dev') ||
+      (github.ref == 'refs/heads/develop' && matrix.env == 'dev') ||
+      (github.ref == 'refs/heads/test'    && matrix.env == 'test') ||
+      (github.ref == 'refs/heads/master'  && matrix.env == 'prod')
+
+    environment: ${{ matrix.env }}
+
+    env:
+      ENV: ${{ matrix.env }}
+      REGION: asia-south1
+      BRONZE_PROJECT: retail-bronze-${{ matrix.env }}
+      SILVER_PROJECT: retail-silver-${{ matrix.env }}
+      GOLD_PROJECT:   retail-gold-${{ matrix.env }}
+      BRONZE_REPO: retail-${{ matrix.env }}-containers
+      SILVER_REPO:  retail-${{ matrix.env }}-containers
+      GOLD_REPO:    retail-${{ matrix.env }}-containers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: 'beta'
+
+      - name: Configure Artifact Registry auth
+        run: gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      # -------- Build & push images (bronze/silver/gold) --------
+      - name: Build & Push images
+        run: |
+          # Bronze
+          docker build -t ${REGION}-docker.pkg.dev/${BRONZE_PROJECT}/${BRONZE_REPO}/bronze:latest -f infra/docker/bronze/Dockerfile .
+          docker push    ${REGION}-docker.pkg.dev/${BRONZE_PROJECT}/${BRONZE_REPO}/bronze:latest
+          # Silver
+          docker build -t ${REGION}-docker.pkg.dev/${SILVER_PROJECT}/${SILVER_REPO}/silver:latest -f infra/docker/silver/Dockerfile .
+          docker push    ${REGION}-docker.pkg.dev/${SILVER_PROJECT}/${SILVER_REPO}/silver:latest
+          # Gold
+          docker build -t ${REGION}-docker.pkg.dev/${GOLD_PROJECT}/${GOLD_REPO}/gold:latest -f infra/docker/gold/Dockerfile .
+          docker push    ${REGION}-docker.pkg.dev/${GOLD_PROJECT}/${GOLD_REPO}/gold:latest
+
+      # -------- Create/Update Cloud Run Jobs (idempotent) --------
+      - name: Create/Update Cloud Run Jobs
+        run: |
+          # Bronze (ingest)
+          gcloud run jobs describe bronze-load --project ${BRONZE_PROJECT} --region ${REGION} >/dev/null 2>&1 \
+            && gcloud run jobs update bronze-load --image ${REGION}-docker.pkg.dev/${BRONZE_PROJECT}/${BRONZE_REPO}/bronze:latest --project ${BRONZE_PROJECT} --region ${REGION} \
+            || gcloud run jobs create bronze-load --image ${REGION}-docker.pkg.dev/${BRONZE_PROJECT}/${BRONZE_REPO}/bronze:latest --project ${BRONZE_PROJECT} --region ${REGION}
+
+          # Silver (clean)
+          gcloud run jobs describe silver-clean --project ${SILVER_PROJECT} --region ${REGION} >/dev/null 2>&1 \
+            && gcloud run jobs update silver-clean --image ${REGION}-docker.pkg.dev/${SILVER_PROJECT}/${SILVER_REPO}/silver:latest --project ${SILVER_PROJECT} --region ${REGION} \
+            || gcloud run jobs create silver-clean --image ${REGION}-docker.pkg.dev/${SILVER_PROJECT}/${SILVER_REPO}/silver:latest --project ${SILVER_PROJECT} --region ${REGION}
+
+          # Gold (aggregate) — either as a job *or* run SQL below.
+          gcloud run jobs describe gold-agg --project ${GOLD_PROJECT} --region ${REGION} >/dev/null 2>&1 \
+            && gcloud run jobs update gold-agg --image ${REGION}-docker.pkg.dev/${GOLD_PROJECT}/${GOLD_REPO}/gold:latest --project ${GOLD_PROJECT} --region ${REGION} \
+            || gcloud run jobs create gold-agg --image ${REGION}-docker.pkg.dev/${GOLD_PROJECT}/${GOLD_REPO}/gold:latest --project ${GOLD_PROJECT} --region ${REGION}
+
+      # -------- Run DAG: Bronze -> Silver -> Gold --------
+      - name: Run Bronze
+        run: gcloud run jobs execute bronze-load --project ${BRONZE_PROJECT} --region ${REGION}
+
+      - name: Run Silver
+        run: gcloud run jobs execute silver-clean --project ${SILVER_PROJECT} --region ${REGION}
+
+      # Option A: if your gold is SQL, run it here:
+      - name: Gold aggregate (SQL)
+        run: |
+          bq query --project_id=${GOLD_PROJECT} --use_legacy_sql=false < apps/gold/sql/gold_aggregate.sql
+
+      # Option B: if your gold is a job, use this instead:
+      # - name: Run Gold job
+      #   run: gcloud run jobs execute gold-agg --project ${GOLD_PROJECT} --region ${REGION}
+
+      # -------- Validation (counts) --------
+      - name: Validate counts (Bronze vs Silver)
+        run: |
+          bq query --use_legacy_sql=false --project_id=${BRONZE_PROJECT} "
+          WITH b AS (
+            SELECT SUM(written_count) AS c FROM \`${BRONZE_PROJECT}.metadata.audit_log\`
+            WHERE layer='bronze' AND table_name='orders_bronze'
+          ),
+          s AS (
+            SELECT SUM(written_count) AS c FROM \`${SILVER_PROJECT}.metadata.audit_log\`
+            WHERE layer='silver' AND table_name='orders_silver'
+          )
+          SELECT IFNULL((SELECT c FROM b),0) = IFNULL((SELECT c FROM s),0) AS ok;"
